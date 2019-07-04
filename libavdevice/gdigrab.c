@@ -644,6 +644,10 @@ static void paint_mouse_pointer(AVFormatContext *s1, struct gdigrab *gdigrab)
         info.hbmMask = NULL;
         info.hbmColor = NULL;
 
+        int log_x = ci.ptScreenPos.x;
+        int log_y = ci.ptScreenPos.y;
+        int ind   = get_monitor_id_by_logical_point(log_x, log_y);
+
         if (ci.flags != CURSOR_SHOWING)
             return;
 
@@ -663,21 +667,17 @@ static void paint_mouse_pointer(AVFormatContext *s1, struct gdigrab *gdigrab)
             RECT rect;
 
             if (GetWindowRect(hwnd, &rect)) {
-                pos.x = ci.ptScreenPos.x - clip_rect.left - info.xHotspot - rect.left;
-                pos.y = ci.ptScreenPos.y - clip_rect.top - info.yHotspot - rect.top;
-
-                //that would keep the correct location of mouse with hidpi screens
-                pos.x = pos.x * desktophorzres / horzres;
-                pos.y = pos.y * desktopvertres / vertres;
+                /* make cursor's logical coordinates relative to window */
+                log_x -= rect.left;
+                log_y -= rect.top;
             } else {
                 CURSOR_ERROR("Couldn't get window rectangle");
                 goto icon_error;
             }
-        } else {
-            //that would keep the correct location of mouse with hidpi screens
-            pos.x = ci.ptScreenPos.x * desktophorzres / horzres - clip_rect.left - info.xHotspot;
-            pos.y = ci.ptScreenPos.y * desktopvertres / vertres - clip_rect.top - info.yHotspot;
         }
+        /* that would keep the correct location of mouse with hidpi screens */
+        pos.x = LOGICAL_TO_PHYSICAL_X(log_x, ind) - clip_rect.left - info.xHotspot;
+        pos.y = LOGICAL_TO_PHYSICAL_Y(log_y, ind) - clip_rect.top  - info.yHotspot;
 
         av_log(s1, AV_LOG_DEBUG, "Cursor pos (%li,%li) -> (%li,%li)\n",
                 ci.ptScreenPos.x, ci.ptScreenPos.y, pos.x, pos.y);
