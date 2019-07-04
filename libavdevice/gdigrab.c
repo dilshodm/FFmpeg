@@ -212,6 +212,165 @@ gdigrab_region_wnd_update(AVFormatContext *s1, struct gdigrab *gdigrab)
     }
 }
 
+typedef struct tagRESOLUTION {
+    int x;
+    int y;
+} RESOLUTION;
+
+typedef struct tagMONITOR {
+    RESOLUTION logical;
+    RESOLUTION physical;
+    RECT rect;
+} MONITOR;
+
+#define MY_MAX_MONITORS 4
+static MONITOR monitors[MY_MAX_MONITORS];
+static int monitorsNum = 0;
+static RECT rcCombined;
+
+/**
+ * Callback function which is used by EnumDisplayMonitors()
+ *
+ * @param hMon
+ * @param hdc
+ * @param lprcMonitor - rectangle of the given monitor
+ * @param pData - arbitrary user data passed to EnumDisplayMonitors
+ * @return TRUE
+ */
+static BOOL CALLBACK
+monitor_enum(HMONITOR hMon, HDC hdc, LPRECT lprcMonitor, LPARAM pData)
+{
+    monitors[monitorsNum].rect = *lprcMonitor;
+    UnionRect(&rcCombined, &rcCombined, lprcMonitor);
+
+    MONITORINFOEXA monitor_info;
+    monitor_info.cbSize = sizeof (monitor_info);
+    GetMonitorInfoA(hMon, &monitor_info);
+
+    HDC monitor_hdc = CreateDCA(NULL, monitor_info.szDevice, NULL, NULL);
+
+    monitors[monitorsNum].logical.x  = GetDeviceCaps(monitor_hdc, HORZRES);
+    monitors[monitorsNum].logical.y  = GetDeviceCaps(monitor_hdc, VERTRES);
+    monitors[monitorsNum].physical.x = GetDeviceCaps(monitor_hdc, DESKTOPHORZRES);
+    monitors[monitorsNum].physical.y = GetDeviceCaps(monitor_hdc, DESKTOPVERTRES);
+
+    DeleteDC(monitor_hdc);
+
+    ++monitorsNum;
+    return TRUE;
+}
+
+/**
+ * Returns the monitor id by given logical coordinates
+ * of a pixel
+ *
+ * @param x Logical coordinate x
+ * @param y Logical coordinate y
+ * @return id of monitor (in monitors) on success, -1 on error
+ */
+static int
+get_monitor_id_by_logical_point(int x, int y)
+{
+    for (int i = 0; i < monitorsNum; ++i) {
+        if (monitors[i].rect.left <= x && x < monitors[i].rect.right &&
+                monitors[i].rect.top  <= y && y < monitors[i].rect.bottom)
+            return i;
+    }
+
+    return -1;
+}
+
+/**
+ * Returns the monitor id by given logical coordinates
+ * of a rectangle. The center of rectangle is used to get monitor
+ *
+ * @param rect Logical coordinates of rect
+ * @return id of monitor (in monitors) on success, -1 on error
+ */
+static int
+get_monitor_id_by_logical_rectangle(const RECT *rect)
+{
+    int x = rect->left + (rect->right  - rect->left) / 2;
+    int y = rect->top  + (rect->bottom - rect->top)  / 2;
+    return get_monitor_id_by_logical_point(x, y);
+}
+
+/**
+ * Returns the monitor id by given x coordinate
+ *
+ * @param x Logical coordinate x
+ * @return id of monitor (in monitors) on success, -1 on error
+ */
+static int
+get_monitor_id_by_logical_x(int x)
+{
+    for (int i = 0; i < monitorsNum; ++i) {
+        if (monitors[i].rect.left <= x && x < monitors[i].rect.right)
+            return i;
+    }
+
+    return -1;
+}
+
+/**
+ * Returns the monitor id by given y coordinate
+ *
+ * @param y Logical coordinate y
+ * @return id of monitor (in monitors) on success, -1 on error
+ */
+static int
+get_monitor_id_by_logical_y(int y)
+{
+    for (int i = 0; i < monitorsNum; ++i) {
+        if (monitors[i].rect.top <= y && y < monitors[i].rect.bottom)
+            return i;
+    }
+
+    return -1;
+}
+
+#define LOGICAL_TO_PHYSICAL_X(val, i) ((val) * monitors[i].physical.x / monitors[i].logical.x)
+#define LOGICAL_TO_PHYSICAL_Y(val, i) ((val) * monitors[i].physical.y / monitors[i].logical.y)
+
+/**
+ * Converts given rect from logical to physical pixel coordinates
+ *
+ * @param rect in logical coordinates, it will be modified to physical coordinates
+ * @return void
+ */
+static void
+convert_logical_rect_to_physical(RECT *rect)
+{
+    int indX;
+    int indY;
+    int ind;
+
+    /* convert top-left corner */
+    ind = get_monitor_id_by_logical_point(rect->left, rect->top);
+    if (ind >= 0) {
+        indX = indY = ind;
+    } else {
+        /* monitor not found, let's search by x and y separately */
+        indX = get_monitor_id_by_logical_x(rect->left);
+        indY = get_monitor_id_by_logical_y(rect->top);
+    }
+    rect->left = LOGICAL_TO_PHYSICAL_X(rect->left, indX);
+    rect->top  = LOGICAL_TO_PHYSICAL_Y(rect->top,  indY);
+
+    /* convert bottom-right corner, we have to make -1 because bottom-right
+     * corner is not incluse */
+    ind = get_monitor_id_by_logical_point(rect->right - 1, rect->bottom - 1);
+    if (ind >= 0) {
+        indX = indY = ind;
+    } else {
+        /* monitor not found, let's search by x and y separately */
+        indX = get_monitor_id_by_logical_x(rect->right  - 1);
+        indY = get_monitor_id_by_logical_y(rect->bottom - 1);
+    }
+    rect->right  = LOGICAL_TO_PHYSICAL_X(rect->right,  indX);
+    rect->bottom = LOGICAL_TO_PHYSICAL_Y(rect->bottom, indY);
+}
+
 /**
  * Initializes the gdi grab device demuxer (public device demuxer API).
  *
@@ -235,10 +394,6 @@ gdigrab_read_header(AVFormatContext *s1)
     AVStream   *st       = NULL;
 
     int bpp;
-    int horzres;
-    int vertres;
-    int desktophorzres;
-    int desktopvertres;
     RECT virtual_rect;
     RECT clip_rect;
     BITMAP bmp;
@@ -277,24 +432,49 @@ gdigrab_read_header(AVFormatContext *s1)
     }
     bpp = GetDeviceCaps(source_hdc, BITSPIXEL);
 
-    horzres = GetDeviceCaps(source_hdc, HORZRES);
-    vertres = GetDeviceCaps(source_hdc, VERTRES);
-    desktophorzres = GetDeviceCaps(source_hdc, DESKTOPHORZRES);
-    desktopvertres = GetDeviceCaps(source_hdc, DESKTOPVERTRES);
+    /* Get resolution and coordinates for all monitors */
+    SetRectEmpty(&rcCombined);
+    monitorsNum = 0;
+    EnumDisplayMonitors(0, 0, monitor_enum, 0);
+
+    for (int i = 0; i < monitorsNum; ++i) {
+        av_log(s1, AV_LOG_DEBUG,
+               "Monitor %i (%li,%li) (%li,%li), logical res:(%li,%li), physical res:(%li,%li)\n",
+               i, monitors[i].rect.left, monitors[i].rect.top,
+               monitors[i].rect.right, monitors[i].rect.bottom,
+               monitors[i].logical.x, monitors[i].logical.y,
+               monitors[i].physical.x, monitors[i].physical.y);
+    }
 
     if (hwnd) {
+        /* get actual window coordinates to retrieve it's monitor index */
+        GetWindowRect(hwnd, &virtual_rect);
+        int ind = get_monitor_id_by_logical_rectangle(&virtual_rect);
+
         GetClientRect(hwnd, &virtual_rect);
+        av_log(s1, AV_LOG_DEBUG, "Window rect logical (%li,%li)x(%li,%li)",
+               virtual_rect.left, virtual_rect.top, virtual_rect.right, virtual_rect.bottom);
+
         /* window -- get the right height and width for scaling DPI */
-        virtual_rect.left   = virtual_rect.left   * desktophorzres / horzres;
-        virtual_rect.right  = virtual_rect.right  * desktophorzres / horzres;
-        virtual_rect.top    = virtual_rect.top    * desktopvertres / vertres;
-        virtual_rect.bottom = virtual_rect.bottom * desktopvertres / vertres;
+        virtual_rect.left   = LOGICAL_TO_PHYSICAL_X(virtual_rect.left,   ind);
+        virtual_rect.right  = LOGICAL_TO_PHYSICAL_X(virtual_rect.right,  ind);
+        virtual_rect.top    = LOGICAL_TO_PHYSICAL_Y(virtual_rect.top,    ind);
+        virtual_rect.bottom = LOGICAL_TO_PHYSICAL_Y(virtual_rect.bottom, ind);
+        av_log(s1, AV_LOG_DEBUG, ", physical (%li,%li)x(%li,%li)\n",
+               virtual_rect.left, virtual_rect.top, virtual_rect.right, virtual_rect.bottom);
     } else {
-        /* desktop -- get the right height and width for scaling DPI */
         virtual_rect.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
         virtual_rect.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        virtual_rect.right = (virtual_rect.left + GetSystemMetrics(SM_CXVIRTUALSCREEN)) * desktophorzres / horzres;
-        virtual_rect.bottom = (virtual_rect.top + GetSystemMetrics(SM_CYVIRTUALSCREEN)) * desktopvertres / vertres;
+        virtual_rect.right = (virtual_rect.left + GetSystemMetrics(SM_CXVIRTUALSCREEN)) ;
+        virtual_rect.bottom = (virtual_rect.top + GetSystemMetrics(SM_CYVIRTUALSCREEN)) ;
+
+        av_log(s1, AV_LOG_DEBUG, "Virtual desktop logical (%li,%li)x(%li,%li)",
+               virtual_rect.left, virtual_rect.top, virtual_rect.right, virtual_rect.bottom);
+
+        /* desktop -- get the right height and width for scaling DPI */
+        convert_logical_rect_to_physical(&virtual_rect);
+        av_log(s1, AV_LOG_DEBUG, ", physical (%li,%li)x(%li,%li)\n",
+               virtual_rect.left, virtual_rect.top, virtual_rect.right, virtual_rect.bottom);
     }
 
     /* If no width or height set, use full screen/window area */
